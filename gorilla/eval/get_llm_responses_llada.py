@@ -1,32 +1,3 @@
-# Copyright 2023 https://github.com/ShishirPatil/gorilla
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#    http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-"""
-LLaDA (Large Language Diffusion with Masking) inference script for Gorilla API Benchmark.
-
-This script uses the LLaDA-8B-Instruct model to generate API call recommendations
-based on natural language queries.
-
-Usage:
-    python get_llm_responses_llada.py \
-        --output_file eval-data/responses/torchhub/response_torchhub_llada_0_shot.jsonl \
-        --question_data eval-data/questions/torchhub/questions_torchhub_0_shot.jsonl \
-        --api_name torchhub \
-        --steps 128 \
-        --gen_length 256 \
-        --block_length 32
-"""
 
 import argparse
 import os
@@ -40,6 +11,14 @@ from tqdm import tqdm
 from rank_bm25 import BM25Okapi
 
 from transformers import AutoTokenizer, AutoModel
+
+# Add retrievers directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from retrievers import BM25Retriever, GPTRetriever
+from retrievers.build_json_index import JSONLReader
+
+# System prompt for API writing (matching retriever version)
+SYSTEM_PROMPT = "You are a helpful API writer who can write APIs based on requirements."
 
 
 def add_gumbel_noise(logits, temperature):
@@ -158,7 +137,11 @@ def generate(model, prompt, attention_mask=None, steps=128, gen_length=128, bloc
 
 
 def encode_question(question, api_name, retrieved_docs=None):
-    """Encode multiple prompt instructions into a single string."""
+    """Encode multiple prompt instructions into a single string.
+    
+    Returns:
+        tuple: (base_prompt, full_prompt_with_docs) for logging purposes
+    """
     
     if api_name == "torchhub":
         domains = "1. $DOMAIN is inferred from the task description and should include one of {Classification, Semantic Segmentation, Object Detection, Audio Separation, Video Classification, Text-to-Speech}."
@@ -179,25 +162,42 @@ def encode_question(question, api_name, retrieved_docs=None):
         print("Error: API name is not supported.")
         domains = ""
 
-    prompt = question + "\nWrite a python program in 1 to 2 lines to call API in " + api_name + ".\n\nThe answer should follow the format: <<<domain>>> $DOMAIN, <<<api_call>>>: $API_CALL, <<<api_provider>>>: $API_PROVIDER, <<<explanation>>>: $EXPLANATION, <<<code>>>: $CODE}. Here are the requirements:\n" + domains + "\n2. The $API_CALL should have only 1 line of code that calls api.\n3. The $API_PROVIDER should be the programming framework used.\n4. $EXPLANATION should be a step-by-step explanation.\n5. The $CODE is the python code.\n6. Do not repeat the format in your answer."
+    base_prompt = question + "\nWrite a python program in 1 to 2 lines to call API in " + api_name + ".\n\nThe answer should follow the format: <<<domain>>> $DOMAIN, <<<api_call>>>: $API_CALL, <<<api_provider>>>: $API_PROVIDER, <<<explanation>>>: $EXPLANATION, <<<code>>>: $CODE}. Here are the requirements:\n" + domains + "\n2. The $API_CALL should have only 1 line of code that calls api.\n3. The $API_PROVIDER should be the programming framework used.\n4. $EXPLANATION should be a step-by-step explanation.\n5. The $CODE is the python code.\n6. Do not repeat the format in your answer."
     
-    # Add retrieved API documentation if available
+    # Add retrieved API documentation if available (matching retriever version wording)
+    full_prompt = base_prompt
     if retrieved_docs:
-        prompt += "\n\nHere are some reference API docs:"
+        full_prompt += "\nHere are some reference docs:"
         for i, doc in enumerate(retrieved_docs):
-            prompt += f"\nAPI {i}: {doc}"
+            full_prompt += "\nAPI " + str(i) + ": " + str(doc)
     
-    return prompt
+    return base_prompt, full_prompt
 
 
 def get_response_llada(model, tokenizer, question, api_name, device, steps=128, gen_length=256, block_length=32, temperature=0., retrieved_docs=None):
-    """Get response from LLaDA model for a single question."""
+    """Get response from LLaDA model for a single question.
     
-    # Encode the question
-    prompt_text = encode_question(question, api_name, retrieved_docs=retrieved_docs)
+    Returns:
+        tuple: (response, system_prompt, user_prompt, retrieved_docs_list)
+            - response: The model's generated response
+            - system_prompt: The system prompt used
+            - user_prompt: The full user prompt with context
+            - retrieved_docs_list: List of retrieved doc strings for logging
+    """
     
-    # Format for instruct model
-    messages = [{"role": "user", "content": prompt_text}]
+    # Convert Document objects to strings if needed
+    retrieved_docs_list = None
+    if retrieved_docs:
+        retrieved_docs_list = [doc.page_content if hasattr(doc, 'page_content') else str(doc) for doc in retrieved_docs]
+    
+    # Encode the question (returns base_prompt and full_prompt with docs)
+    base_prompt, full_prompt = encode_question(question, api_name, retrieved_docs=retrieved_docs_list)
+    
+    # Format for instruct model with system prompt (matching retriever version)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": full_prompt}
+    ]
     formatted_prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
     
     # Tokenize
@@ -224,7 +224,7 @@ def get_response_llada(model, tokenizer, question, api_name, device, steps=128, 
     
     # Decode
     response = tokenizer.decode(output[0, input_ids.shape[1]:], skip_special_tokens=True)
-    return response
+    return response, SYSTEM_PROMPT, full_prompt, retrieved_docs_list
 
 
 def write_result_to_file(result, output_file):
@@ -260,8 +260,12 @@ def main():
                         help="Maximum number of questions to process (for testing, None for all)")
     parser.add_argument("--api_dataset", type=str, default=None,
                         help="Path to the API dataset for retrieval (enables RAG mode)")
-    parser.add_argument("--num_docs", type=int, default=3,
-                        help="Number of API docs to retrieve (when using retrieval)")
+    parser.add_argument("--num_docs", type=int, default=1,
+                        help="Number of API docs to retrieve (when using retrieval, default=1 to match retriever version)")
+    parser.add_argument("--retriever", type=str, default="bm25", choices=["bm25", "gpt"],
+                        help="Which retriever to use: 'bm25' (local, fast) or 'gpt' (OpenAI embeddings, semantic)")
+    parser.add_argument("--api_key", type=str, default=None,
+                        help="OpenAI API key for GPT retriever (or set OPENAI_API_KEY env var)")
     args = parser.parse_args()
 
     # Check device availability
@@ -292,18 +296,43 @@ def main():
     # Check that pad token doesn't equal mask token
     assert tokenizer.pad_token_id != 126336, "Pad token ID should not equal mask token ID"
 
-    # Initialize BM25 retriever if API dataset is provided
-    bm25 = None
-    corpus = None
+    # Initialize retriever if API dataset is provided
+    retriever = None
     if args.api_dataset:
         print(f"Loading API dataset for retrieval: {args.api_dataset}")
-        corpus = []
-        with open(args.api_dataset, 'r') as f:
-            for line in f:
-                corpus.append(json.loads(line))
-        tokenized_corpus = [str(doc).split(" ") for doc in corpus]
-        bm25 = BM25Okapi(tokenized_corpus)
-        print(f"Loaded {len(corpus)} API docs, will retrieve top {args.num_docs} for each question")
+        print(f"Using {args.retriever} retriever with top {args.num_docs} docs")
+        
+        if args.retriever == "gpt":
+            # GPT retriever uses OpenAI embeddings
+            api_key = args.api_key or os.environ.get("OPENAI_API_KEY")
+            if not api_key:
+                raise ValueError("GPT retriever requires OpenAI API key. Set --api_key or OPENAI_API_KEY env var.")
+            os.environ["OPENAI_API_KEY"] = api_key
+            
+            retriever = GPTRetriever(index=[], query_kwargs={"similarity_top_k": args.num_docs})
+            index_path = args.retriever + '_dataset_index.json'
+            
+            if os.path.exists(index_path):
+                print(f"Loading existing GPT index from: {index_path}")
+                retriever.load_from_disk(index_path)
+            else:
+                print(f"Creating GPT index (this may take a while)...")
+                documents = JSONLReader().load_data(args.api_dataset)
+                retriever.from_documents(documents)
+                retriever.save_to_disk(retriever.index, index_path)
+                print(f"Saved GPT index to: {index_path}")
+                
+        elif args.retriever == "bm25":
+            # BM25 retriever uses term frequency
+            corpus = []
+            with open(args.api_dataset, 'r') as f:
+                for line in f:
+                    corpus.append(json.loads(line))
+            tokenized_corpus = [str(doc).split(" ") for doc in corpus]
+            bm25 = BM25Okapi(tokenized_corpus)
+            retriever = BM25Retriever(index=bm25, corpus=corpus, query_kwargs={"similarity_top_k": args.num_docs})
+        
+        print(f"Retriever initialized successfully")
 
     # Read questions
     print(f"Loading questions from: {args.question_data}")
@@ -335,11 +364,10 @@ def main():
         try:
             # Retrieve relevant API docs if retriever is available
             retrieved_docs = None
-            if bm25 is not None and corpus is not None:
-                tokenized_query = question.split(" ")
-                retrieved_docs = bm25.get_top_n(tokenized_query, corpus, n=args.num_docs)
+            if retriever is not None:
+                retrieved_docs = retriever.get_relevant_documents(question)
             
-            response = get_response_llada(
+            response, system_prompt, user_prompt, retrieved_docs_list = get_response_llada(
                 model, 
                 tokenizer, 
                 question, 
@@ -352,26 +380,42 @@ def main():
                 retrieved_docs=retrieved_docs
             )
             
+            # Full result with context for analysis
             result = {
-                'text': response, 
+                'text': response,
                 'question_id': question_id, 
                 'answer_id': "None", 
-                'model_id': args.model_name, 
+                'model_id': args.model_name,
+                # Additional context for analysis
+                'system_prompt': system_prompt,
+                'user_prompt': user_prompt,
+                'original_question': question,
+                'api_name': args.api_name,
+                'retrieved_docs': retrieved_docs_list,
                 'metadata': {
                     'steps': args.steps,
                     'gen_length': args.gen_length,
                     'block_length': args.block_length,
-                    'temperature': args.temperature
+                    'temperature': args.temperature,
+                    'retriever': args.retriever if retriever else None,
+                    'num_docs': args.num_docs if retriever else None
                 }
             }
             
         except Exception as e:
             print(f"Error processing question {question_id}: {e}")
+            import traceback
+            traceback.print_exc()
             result = {
                 'text': f"Error: {str(e)}", 
                 'question_id': question_id, 
                 'answer_id': "None", 
-                'model_id': args.model_name, 
+                'model_id': args.model_name,
+                'system_prompt': SYSTEM_PROMPT,
+                'user_prompt': None,
+                'original_question': question,
+                'api_name': args.api_name,
+                'retrieved_docs': None,
                 'metadata': {'error': str(e)}
             }
         

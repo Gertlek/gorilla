@@ -17,7 +17,7 @@ from typing import Any, Dict, List, cast, Optional
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_random_exponential
 from retrievers.schema import BaseRetriever, Document
-import openai
+from openai import OpenAI
 import numpy as np
 import os
 import copy
@@ -31,15 +31,15 @@ class GPTRetriever(BaseRetriever, BaseModel):
     @retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
     def get_embeddings(
         self,
-	list_of_text: List[str],
-	engine: Optional[str] = None,
+        list_of_text: List[str],
+        engine: Optional[str] = None,
     ) -> List[List[float]]:
         assert len(list_of_text) <= 2048, "The number of docs should be <= 2048"
         list_of_text = [text.replace("\n", " ") for text in list_of_text]
-        openai.api_key = os.environ["OPENAI_API_KEY"]
-        data = openai.Embedding.create(input=list_of_text, engine="text-embedding-ada-002").data
-        data = sorted(data, key=lambda x: x["index"])  # maintain the same order as input.
-        return [d["embedding"] for d in data]
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        response = client.embeddings.create(input=list_of_text, model="text-embedding-ada-002")
+        data = sorted(response.data, key=lambda x: x.index)  # maintain the same order as input.
+        return [d.embedding for d in data]
   
     def from_documents(self, documents: List):
         contents = [document.page_content for document in documents]
